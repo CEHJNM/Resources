@@ -1,0 +1,878 @@
+---
+title: "XGBoost_model"
+author: "Nidhi Ram"
+date: "2025-09-08"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Prepare data
+```{r}
+us_grid <- st_transform(us_grid, 5070)
+us_grid$cafo_count <- lengths(st_intersects(us_grid, combined_cafos))
+us_grid <- subset(us_grid, select = -c(has_dat))
+
+known_states <- fips(state = unique(combined_cafos$state_name))
+us_grid$has_data <- substr(us_grid$FIPS, 1, 2) %in% known_states # model on data we have
+us_grid <- us_grid %>%
+  mutate(cafo_count = ifelse(has_data, cafo_count, NA)) # record NA where we know we don't have data
+
+```
+
+# Negative Downsampling
+```{r}
+positive <- us_grid %>% filter(cafo_count > 0)
+negative_candidates <- us_grid %>% filter(cafo_count == 0)
+n_pos <- nrow(positive)
+negatives <- negative_candidates %>% slice_sample(n = round(0.5*n_pos))
+
+```
+
+# Labeled vs Unlabeled
+```{r}
+# combine positive and negative
+labeled <- bind_rows(mutate(positive, label = 1), mutate(negatives, label = 0))
+
+features <- c("cropland", "pastureland", "RUCC_2023", "methane", "mean_EJI", "population", "canopy_cover", "dist_to_ag_cluster_km", "dist_to_facility", "phosphorus", "Black", "Hispanic", "animal_count", "animal_N", "animal_P", "Other_P_kg_2017", "Other_N_kg_2017", "median_income", "dist_to_urban", "female_ag_employment", "male_ag_employment", "epa_totals", "Total_CAFOs", "x", "y")
+
+coords <- st_coordinates(st_centroid(labeled))
+labeled_df <- labeled %>%
+  st_drop_geometry() %>%
+  mutate(x = coords[, 1], y = coords[, 2]) %>%
+  dplyr::select(cafo_count, all_of(features), x, y, FIPS, STATE_N)
+
+labeled_df$log_cafo <- log1p(labeled_df$cafo_count)
+labeled$log_cafo <- log1p(labeled$cafo_count)
+
+labeled_df$weight <- ifelse(labeled_df$log_cafo > 2.4, 10,
+                            ifelse(labeled_df$log_cafo > 0, 5, 1))
+
+```
+
+# Clean up Labeled 
+```{r}
+labeled <- labeled[!is.na(labeled$`animal_count`), ]
+labeled <- labeled[!is.na(labeled$`female_ag_employment`), ]
+
+labeled_df <- na.omit(labeled_df)
+us_grid_df <- na.omit(us_grid_df)
+
+labeled_df$class <- cut(
+  labeled_df$cafo_count,
+  breaks = c(-1, 0, 9, Inf),
+  labels = c("class0", "class1", "class2"),
+  right = TRUE)
+labeled_df$class <- factor(labeled_df$class)
+
+labeled_df <- labeled_df %>%
+  mutate(
+    crop_density = cropland * population,
+    ag_intensity = (animal_count + animal_N + animal_P) / (cropland + pastureland + 1),
+    rural_income = median_income * (RUCC_2023 > 6))
+
+```
+
+# Spatial Autocorrelation and CV
+```{r}
+library(blockCV)
+autocorr <- cv_spatial_autocor(x = labeled, column = "log_cafo", plot=TRUE, progress=TRUE, num_sample = 6000)
+
+spatial_blocks <- blockCV::cv_spatial(
+  labeled,
+  k = 5,
+  size = 140000,
+  hexagon = FALSE,
+  progress = FALSE)
+
+train_ids <- lapply(spatial_blocks$folds_list, function(x) x[[1]])
+test_ids <- lapply(spatial_blocks$folds_list, function(x) x[[2]])
+tr_control <- caret::trainControl(
+  method = "cv",
+  index = train_ids,
+  indexOut = test_ids,
+  savePredictions = TRUE)
+```
+
+# Parameter Grid
+```{r}
+xgb_grid <- expand.grid(
+  nrounds = 400,
+  max_depth = 4,
+  eta = 0.03,
+  gamma = 0.1,
+  colsample_bytree = 0.6,
+  min_child_weight = 3, subsample = 0.8)
+
+```
+
+# Model
+```{r}
+features <- c("cropland", "pastureland", "RUCC_2023", "methane", "mean_EJI", "population", "canopy_cover", "dist_to_ag_cluster_km", "dist_to_facility", "phosphorus", "Black", "Hispanic", "animal_count", "animal_N", "animal_P", "Other_P_kg_2017", "Other_N_kg_2017", "median_income", "dist_to_urban", "female_ag_employment", "male_ag_employment","epa_totals", "Total_CAFOs", "crop_density", "ag_intensity", "rural_income", "x", "y")
+
+xgb_model <- caret::train(
+  log_cafo ~  cropland + pastureland + population + mean_EJI + canopy_cover + dist_to_facility + Black +
+    animal_count + animal_P + animal_N + median_income + `Other_P_kg_2017` + Hispanic + dist_to_ag_cluster_km + 
+    RUCC_2023  + `Other_N_kg_2017` + dist_to_urban + methane + phosphorus + x + y + epa_totals + Total_CAFOs + rural_income + crop_density + ag_intensity,
+  data = labeled_df,
+  method = "xgbTree",
+  trControl = tr_control,
+  tuneGrid = xgb_grid,
+  verbosity = 1, weights = labeled_df$weight)
+
+
+# look at correlation between variables, discard those with strong correlations
+
+```
+
+
+# Model Results
+```{r}
+xgb_model$results
+xgb_model$resample
+xgb_model$resample %>%
+  summarise(across(c(RMSE, Rsquared, MAE), list(mean = mean, sd = sd)))
+
+```
+
+# Unlabeled
+```{r}
+features <- c("cropland", "pastureland", "RUCC_2023", "methane", "mean_EJI", "population", "canopy_cover", "dist_to_ag_cluster_km", "dist_to_facility", "phosphorus", "Black", "Hispanic", "animal_count", "animal_N", "animal_P", "Other_P_kg_2017", "Other_N_kg_2017", "median_income", "dist_to_urban", "female_ag_employment", "male_ag_employment", "epa_totals", "Total_CAFOs", "x", "y")
+
+
+unlabeled <- us_grid %>% filter(is.na(cafo_count)) 
+coords_unlabeled <- st_coordinates(st_centroid(unlabeled))
+
+unlabeled <- unlabeled %>% 
+  mutate(x = coords_unlabeled[, 1], y = coords_unlabeled[, 2]) %>%
+  dplyr::select(all_of(features), x, y, FIPS, STATE_N) %>%
+  na.omit()
+
+unlabeled_df <- unlabeled %>% 
+  st_drop_geometry() %>%
+  dplyr::select(all_of(features), x, y, FIPS, STATE_N) %>%
+  na.omit()
+
+unlabeled_df <- unlabeled_df %>%
+  mutate(
+    crop_density = cropland * population,
+    ag_intensity = (animal_count + animal_N + animal_P) / (cropland + pastureland + 1),
+    rural_income = median_income * (RUCC_2023 > 6)
+  )
+
+
+```
+
+
+# Prediction
+```{r}
+labeled_df$predicted_cafo <- exp(predict(xgb_model, newdata = labeled_df)) - 1
+unlabeled_df$predicted_cafo <- exp(predict(xgb_model, newdata = unlabeled_df)) - 1
+labeled_df$predicted_cafo <- round(labeled_df$predicted_cafo)
+unlabeled_df$predicted_cafo <- round(unlabeled_df$predicted_cafo)
+labeled_df <- labeled_df %>% mutate(predicted_cafo = ifelse(predicted_cafo < 0, 0, predicted_cafo))
+unlabeled_df <- unlabeled_df %>% mutate(predicted_cafo = ifelse(predicted_cafo < 0, 0, predicted_cafo))
+
+labeled$predicted_cafo <- labeled_df$predicted_cafo
+
+```
+
+# Post-calibration - Labeled
+```{r}
+# labeled
+preds_labeled <- predict(xgb_model, newdata = labeled_df)
+train_pred_df <- data.frame(
+  raw = preds_labeled,
+  true = labeled_df$log_cafo,
+  x = labeled_df$x,
+  y = labeled_df$y)
+cal_model <- lm(true ~ poly(raw, 2, raw = TRUE), data = train_pred_df)
+train_pred_df$calibrated <- predict(cal_model, newdata = train_pred_df)
+train_pred_df$calibrated <- pmax(0, train_pred_df$calibrated)
+train_pred_df$pred_cafo <- exp(train_pred_df$calibrated) - 1
+train_pred_df$true_exp <- exp(train_pred_df$true) - 1
+labeled_df$pred_cafo <- train_pred_df$pred_cafo
+
+```
+
+# Post-calibration - Unlabeled
+```{r}
+# unlabeled
+preds_unlabeled_raw <- predict(xgb_model, newdata = unlabeled_df)
+
+preds_unlabeled_cal <- predict(cal_model, newdata = data.frame(raw = preds_unlabeled_raw))
+preds_unlabeled_cal <- pmax(0, preds_unlabeled_cal)
+
+unlabeled_pred_df <- cbind(unlabeled_df, 
+                           pred_raw = preds_unlabeled_raw, 
+                           pred_cal = preds_unlabeled_cal)
+unlabeled_df$pred_cafo <- unlabeled_pred_df$pred_cal
+
+```
+
+# Post-calibration - OOF data
+```{r}
+oof <- xgb_model$pred
+
+# rebuild OOF prediction dataframe
+train_pred_df <- oof %>%
+  dplyr::select(rowIndex, raw = pred) %>%
+  dplyr::left_join(
+    labeled_df %>%
+      mutate(rowIndex = row_number()) %>%
+      dplyr::select(rowIndex, true = log_cafo, x, y, FIPS, STATE_N),
+    by = "rowIndex")
+
+# OOF calibration
+cal_model <- lm(true ~ poly(raw, 2, raw = TRUE), data = train_pred_df)
+
+train_pred_df$calibrated <- predict(cal_model, newdata = train_pred_df)
+train_pred_df$calibrated <- pmax(0, train_pred_df$calibrated)
+
+# back-transform
+train_pred_df$true_exp <- exp(train_pred_df$true) - 1
+train_pred_df$pred_exp <- exp(train_pred_df$calibrated) - 1
+
+# residuals
+train_pred_df$residual <- train_pred_df$calibrated - train_pred_df$true
+train_pred_df$residual_exp <- train_pred_df$pred_exp - train_pred_df$true_exp
+
+# unlabeled
+preds_unlabeled_raw <- predict(xgb_model, newdata = unlabeled_df)
+
+preds_unlabeled_cal <- predict(cal_model, newdata = data.frame(raw = preds_unlabeled_raw))
+preds_unlabeled_cal <- pmax(0, preds_unlabeled_cal)
+
+unlabeled_pred_df <- cbind(unlabeled_df, 
+                           pred_raw = preds_unlabeled_raw, 
+                           pred_cal = preds_unlabeled_cal)
+unlabeled_df$pred_cafo <- unlabeled_pred_df$pred_cal
+
+
+```
+
+
+## OOF Diagnostics
+```{r}
+# spatial error map
+train_pred_sf <- st_as_sf(
+  train_pred_df,
+  coords = c("x", "y"),
+  crs = 5070)
+
+# title = Calibrated OOF Residual Map
+ggplot(train_pred_sf) +
+  geom_sf(aes(color = residual), size = 0.6, alpha = 1) +
+  scale_color_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "red",
+    midpoint = 0
+  ) +
+  theme_minimal() 
+ggsave("error_map.jpeg", width = 8, height = 5)
+
+# metrics
+metrics_oof <- train_pred_df %>%
+  summarise(
+    MAE = mean(abs(residual_exp)),
+    RMSE = sqrt(mean(residual_exp^2)),
+    Mean_Error = mean(residual_exp),
+    Median_Error = median(residual_exp),
+    Pearson = cor(pred_exp, true_exp),
+    Spearman = cor(pred_exp, true_exp, method = "spearman"))
+
+print(metrics_oof)
+
+# residual distribution: OOF Residual Distribution
+ggplot(train_pred_df, aes(residual_exp)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50, fill = "grey70") +
+  geom_density(linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme_minimal() + xlim(-8, 8) +
+  labs(x = "Residuals", y = "Density")
+ggsave("residual_dist.jpeg", width = 8, height = 5)
+
+# true vs predicted
+ggplot(train_pred_df, aes(true, calibrated)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  theme_minimal() +
+  labs(
+    title = "OOF: True vs Calibrated Prediction",
+    x = "Observed CAFO Counts",
+    y = "Predicted CAFO Counts")
+
+```
+
+## OOF County-Level Aggregation
+```{r}
+counties <- st_transform(us_counties_contiguous, st_crs(train_pred_sf))
+train_pred_sf <- st_join(train_pred_sf, counties["FIPS"])
+
+county_pred <- train_pred_sf %>%
+  st_drop_geometry() %>%
+  group_by(FIPS.y) %>%
+  summarise(
+    pred_sum = sum(pred_exp, na.rm = TRUE),
+    true_sum = sum(true_exp, na.rm = TRUE),
+    residual = pred_sum - true_sum,
+    n_cells = n())
+
+# compare to EPA (old counts)
+county_compare <- county_pred %>%
+  left_join(epa_cafo_density, by = c("FIPS.y" = "FIPS"))
+
+ggplot(county_compare, aes(log1p(epa_totals), log1p(pred_sum))) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  theme_minimal() +
+  labs(
+    x = "EPA County CAFO Count",
+    y = "OOF Predicted County CAFO Count",
+    title = "OOF County-Level Comparison")
+
+# updated previous figure w/ distribution: OOF County-Level Predictions vs. EPA Totals
+options(repr.plot.width = 8, repr.plot.height =3)
+gg1 <- ggplot(county_compare, aes(log1p(epa_totals), log1p(pred_sum))) +
+  geom_point(alpha = 0.3, size = 1) + 
+  geom_density_2d(color ="black", linewidth = 0.6) + 
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red", linewidth = 0.8) + 
+  coord_equal() +
+  theme_minimal() +
+  labs(x= "EPA County CAFO Count", y = "OOF Predicted County CAFO Count")
+ggsave("county_epa_compare.jpeg", width = 8, height = 5)
+
+# residual distribution: title = Distribution of County-Level OOF Residuals
+county_compare <- county_compare %>%
+  mutate(log_residual = log1p(pred_sum) - log1p(epa_totals))
+
+gg2 <- ggplot(county_compare, aes(residual)) +
+  geom_histogram(bins = 40, fill = "gray", color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  theme_minimal() + xlim(-20,20)+
+  labs(x = "Residuals", y = "Number of Counties")
+ggsave("county_residuals.jpeg", width = 8, height = 5)
+grid.arrange(gg1, gg2, ncol = 2)
+
+ggplot(county_compare,
+       aes(x = log1p(epa_totals), y = residual)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = TRUE, color = "black") +
+  theme_minimal() +
+  labs(
+    x = "EPA County CAFO Count (log scale)",
+    y = "Prediction Error (Predicted − EPA)",
+    title = "County-Level Bias vs EPA Totals")
+
+county_compare <- county_compare %>%
+  mutate(ratio = pred_sum / (epa_totals + 1e-6))
+
+ggplot(county_compare,
+       aes(x = log1p(epa_totals), y = ratio)) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey40") +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = TRUE) +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(
+    x = "EPA County CAFO Count (log scale)",
+    y = "Predicted / EPA",
+    title = "County-Level Prediction Ratio")
+
+county_binned <- county_compare %>%
+  mutate(bin = ntile(epa_totals, 10)) %>%
+  group_by(bin) %>%
+  summarise(
+    epa_mean = mean(epa_totals, na.rm = TRUE),
+    pred_mean = mean(pred_sum, na.rm = TRUE))
+
+ggplot(county_binned,
+       aes(x = log1p(epa_mean), y = pred_mean)) +
+  geom_point(size = 3) +
+  geom_line() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  theme_minimal() +
+  labs(
+    x = "Mean EPA CAFO Count (per bin)",
+    y = "Mean Predicted CAFO Count",
+    title = "Binned County-Level Comparison")
+
+ggplot(county_compare, aes(residual)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 40, fill = "grey70") +
+  geom_density(linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme_minimal() +
+  labs(
+    title = "County-Level Error Distribution",
+    x = "Predicted − EPA CAFO Count")
+
+county_compare %>%
+  summarise(
+    Mean_Error = mean(residual, na.rm = TRUE),
+    Median_Error = median(residual, na.rm = TRUE),
+    Pearson = cor(pred_sum, epa_totals, use = "complete.obs"),
+    Spearman = cor(pred_sum, epa_totals, use = "complete.obs", method = "spearman"))
+```
+
+## Correlation, R2 Before and After
+```{r}
+cor_before <- cor(train_pred_df$true, train_pred_df$raw)
+r2_before <- 1 - sum((train_pred_df$true - train_pred_df$raw)^2) / sum((train_pred_df$true - mean(train_pred_df$true))^2)
+
+# after
+cor_after <- cor(train_pred_df$true, train_pred_df$calibrated)
+r2_after <- 1 - sum((train_pred_df$true - train_pred_df$calibrated)^2) / sum((train_pred_df$true - mean(train_pred_df$true))^2)
+data.frame(metric = c("pearson", "R2"), before = c(cor_before, r2_before), after = c(cor_after, r2_after))
+
+
+```
+
+# Map Outbreaks
+```{r}
+outbreaks <- read.csv("hpai-outbreaks-clean-placeholder-032124.csv", stringsAsFactors = FALSE)
+
+# Remove rows with missing latitude or longitude, there is one with missing spatial information
+outbreaks_clean <- outbreaks %>%
+  filter(!is.na(lat) & !is.na(lon))
+
+# Convert outbreaks data to an sf object
+outbreaks_sf <- st_as_sf(outbreaks_clean, coords = c("lon", "lat"), crs = 4326)
+
+# Filter to remove Alaska outbreaks
+cont_outbreaks <- outbreaks_sf %>%
+  filter(state != "AK") # State abbreviation for Alaska
+
+# Transform the filtered counties to the same CRS as the outbreaks
+us_counties_contiguous <- st_transform(us_counties_contiguous, crs = st_crs(outbreaks_sf))
+
+# Plot the contiguous US counties and outbreaks
+contiguous_plot <- ggplot() +
+  geom_sf(data = us_counties_contiguous, fill = "lightgray", color = "black", size = 0.2) + # Contiguous counties
+  geom_sf(data = cont_outbreaks, aes(color = "Outbreaks"), size = 1) +                       # Outbreak points
+  scale_color_manual(values = c("Outbreaks" = "black")) +                                   # Custom colors
+  labs(
+       color = "") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5)) # Centered title
+
+print(contiguous_plot)
+
+
+```
+
+# sysetmatic under/overestimation by region
+```{r}
+region_map <- list(
+  Northeast = c("09","23","25","33","34","36","42","44","50"),
+  Midwest   = c("17","18","19","20","26","27","29","31","38","39","46","55"),
+  South     = c("01","05","10","11","12","13","21","22","24","28",
+                "37","40","45","47","48","51","54"),
+  West      = c("02","04","06","08","15","16","30","32","35","41",
+                "49","53","56"))
+
+train_pred_sf$FIPS.y <- sprintf("%05s", train_pred_sf$FIPS.y)
+train_pred_sf$state_fips <- substr(train_pred_sf$FIPS.y, 1, 2)
+
+# assign region
+train_pred_sf$region <- NA_character_
+
+for (r in names(region_map)) {
+  train_pred_sf$region[
+    train_pred_sf$state_fips %in% region_map[[r]]
+  ] <- r
+}
+
+
+region_metrics <- train_pred_sf %>%
+  group_by(region) %>%
+  summarise(
+    MAE = mean(abs(residual)),
+    Mean_Error = mean(residual),
+    Median_Error = median(residual),
+    Over_Pct = mean(residual > 0),
+    Under_Pct = mean(residual < 0),
+    n = n()
+  )
+
+print(region_metrics)
+```
+
+# County level aggregation
+```{r}
+train_pred_sf <- st_as_sf(train_pred_df, coords = c("x", "y"), crs = 5070)
+counties <- st_transform(us_counties_contiguous, st_crs(train_pred_sf))
+train_pred_sf <- st_join(train_pred_sf, counties["FIPS"])
+
+county_pred <- train_pred_sf %>%
+  st_drop_geometry() %>%
+  group_by(FIPS.x) %>%
+  summarise(pred_mean = round(mean(calibrated, na.rm=TRUE),3),
+            pred_sum = round(sum(calibrated, na.rm=TRUE),3),
+            true_mean = mean(true),
+            true_total = sum(true),
+            residual = pred_sum - true_total,
+            n_cells = n())
+
+county_pred_compare <- county_pred %>%
+  left_join(epa_cafo_density, by = c("FIPS.x"="FIPS"))
+
+ggplot(county_pred_compare, aes(x = log1p(epa_totals), y = pred_sum)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    x = "EPA County CAFO Count",
+    y = "Predicted County CAFO Count",
+    title = "County-Level Comparison: Predicted vs EPA Totals")
+
+```
+
+# top 10% predicted counties
+```{r}
+top_counties <- county_pred %>%
+  filter(pred_sum >= quantile(pred_sum, 0.9))
+
+# title = "Top 10% Counties: Predicted vs True"
+ggplot(top_counties, aes(true_total, pred_sum)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  theme_minimal() + xlab("True CAFO Counts") + ylab("Predicted CAFO Counts")
+ggsave("top10counties.jpeg", width=8, height=5)
+
+```
+
+# compare correlation, error dist
+```{r}
+metrics_global <- train_pred_df %>%
+  summarise(
+    MAE = mean(abs(calibrated - true)),
+    RMSE = sqrt(mean((calibrated - true)^2)),
+    Mean_Error = mean(calibrated - true),
+    Median_Error = median(calibrated - true),
+    Pearson = cor(calibrated, true),
+    Spearman = cor(calibrated, true, method = "spearman"))
+
+print(metrics_global)
+
+# Histogram + density -- log(residual)
+ggplot(train_pred_df, aes(residual)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50, fill = "grey70") +
+  geom_density(color = "black", linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Residual Distribution", x = "Residual")
+ggsave("log_residual.jpeg", width=8, height=5)
+
+# Q-Q plot
+ggplot(train_pred_df, aes(sample = residual)) +
+  stat_qq() +
+  stat_qq_line() +
+  theme_minimal() +
+  labs(title = "Q-Q Plot of Residuals")
+
+
+# true vs predicted
+ggplot(train_pred_df, aes(true, calibrated)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  theme_minimal() +
+  labs(title = "True vs Calibrated Predictions",
+       x = "Observed log(CAFO)",
+       y = "Predicted log(CAFO)")
+
+# heteroskedasticity
+ggplot(train_pred_df, aes(calibrated, residual)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Residuals vs Predicted Value",
+       x = "Predicted log(CAFO)",
+       y = "Residual")
+
+```
+
+# high error outliers - county
+```{r}
+outliers <- county_pred %>%
+  mutate(abs_error = abs(residual)) %>%
+  slice_max(abs_error, prop = 0.05)
+
+head(outliers)
+
+ggplot(outliers, aes(true_total, residual)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "High-Error County Outliers")
+
+```
+
+# spatial clustering of errors
+```{r}
+ggplot(train_pred_sf) +
+  geom_sf(aes(color = residual), size = 0.5) +
+  scale_color_gradient2(
+    low = "blue", mid = "white", high = "red", midpoint = 0
+  ) +
+  theme_minimal() +
+  labs(title = "Spatial Distribution of Residuals",
+       color = "Residual")
+
+
+# error symmetry
+mean(train_pred_sf$residual)
+median(train_pred_sf$residual)
+
+```
+
+# Variable Importance
+```{r}
+features <- c("cropland", "pastureland", "RUCC_2023", "methane", "mean_EJI", "population", "canopy_cover", "dist_to_ag_cluster_km", "dist_to_facility", "phosphorus", "Black", "Hispanic", "animal_count", "animal_N", "animal_P", "Other_P_kg_2017", "Other_N_kg_2017", "median_income", "dist_to_urban", "female_ag_employment", "male_ag_employment","epa_totals", "Total_CAFOs", "crop_density", "ag_intensity", "rural_income", "x", "y")
+
+varImp(xgb_model)
+plot(varImp(xgb_model), top = 10)
+ggsave("variable_importance.jpeg", width=8, height=5)
+
+```
+
+# Error Metrics
+## Preds
+```{r}
+
+train_pred_df <- train_pred_df %>%
+  mutate(bucket = case_when(true == log1p(0) ~ "0", true < log1p(10) ~ "<10", true >= log1p(10) ~ ">=10"),
+    abs_error = abs(calibrated - true),
+    rel_error = abs(calibrated-true) / true,
+    abs_error_exp = abs(pred_exp-true_exp),
+    rel_error_exp = abs(pred_exp-true_exp) / true_exp)
+
+```
+
+## MAE (Binned)
+```{r}
+mae_0 <- train_pred_df %>%
+  filter(bucket == "0") %>%
+  summarise(MAE = mean(abs_error_exp)) %>%
+  pull(MAE)
+
+mae_under_10 <- train_pred_df %>%
+  filter(bucket == "<10") %>%
+  summarise(MAE = mean(abs_error_exp)) %>%
+  pull(MAE)
+
+mae_over_10 <- train_pred_df %>%
+  filter(bucket == ">=10") %>%
+  summarise(MAE = mean(abs_error_exp)) %>%
+  pull(MAE)
+
+
+```
+
+## Relative MAE (Binned)
+```{r}
+rel_mae_0 <- train_pred_df %>%
+  filter(bucket == "0") %>%
+  summarise(Rel_MAE = mean(rel_error_exp)) %>%
+  pull(Rel_MAE)
+
+rel_mae_under_10 <- train_pred_df %>%
+  filter(bucket == "<10") %>%
+  summarise(Rel_MAE = mean(rel_error_exp)) %>%
+  pull(Rel_MAE)
+
+rel_mae_over_10 <- train_pred_df %>%
+  filter(bucket == ">=10") %>%
+  summarise(Rel_MAE = mean(rel_error_exp)) %>%
+  pull(Rel_MAE)
+
+
+paste0("MAE [0]: ", round(mae_0, 3))
+paste0("MAE (0,10]: ", round(mae_under_10,3))
+paste0("MAE (10, inf): ", round(mae_over_10, 3))
+paste0("Relative MAE (0, 10): ", round(rel_mae_under_10, 3))
+paste0("Relative MAE (10, inf): ", round(rel_mae_over_10, 3))
+
+```
+
+## Ranking (correlation)
+```{r}
+ranking_corr <- cor(train_pred_df$calibrated, train_pred_df$true, method = "pearson", use = "complete.obs")
+print(ranking_corr)
+```
+
+## Percentage Within 0.2
+```{r}
+pct_within_20 <- train_pred_df %>%
+  filter(bucket == ">=10") %>%
+  summarise(pct = mean(rel_error <= 0.2, na.rm = TRUE)) %>%
+  pull(pct)
+pct_within_20
+```
+
+# In-depth Error Analysis
+
+## log space bin predictions
+```{r}
+train_pred_df <- train_pred_df %>%
+  mutate(log_bin = ntile(true, 5))
+
+bin_ranges <- train_pred_df %>%
+  group_by(log_bin) %>%
+  summarise(
+    n = n(),
+    min_true = min(true_exp, na.rm = TRUE),
+    max_true = max(true_exp, na.rm = TRUE),
+    min_log = min(true, na.rm = TRUE),
+    max_log = max(true, na.rm = TRUE))
+
+print(bin_ranges)
+
+# error stats by log bin
+error_by_log_bin <- train_pred_df %>%
+  group_by(log_bin) %>%
+  summarise(n = n(),
+    mean_abs_error = mean(abs_error, na.rm=TRUE),
+    median_abs_error = median(abs_error, na.rm=TRUE),
+    mean_rel_error = mean(rel_error, na.rm = TRUE),
+    median_rel_error = median(rel_error, na.rm = TRUE),
+    pct_within_5 = mean(abs_error <= 0.05 * (true + 1e-6)),
+    pct_within_10 = mean(abs_error <= 0.10 * (true + 1e-6)))
+print(error_by_log_bin)
+
+ggplot(error_by_log_bin, aes(x = factor(log_bin))) +
+  geom_col(aes(y = mean_rel_error), fill = "blue") +
+  geom_point(aes(y = median_rel_error), color = "red", size = 3) +
+  labs(
+    title = "Relative Error Across Buckets of True Count",
+    x = "Buckets",
+    y = "Relative Error"
+  ) +
+  theme_minimal()
+
+```
+
+## Relative difference between bins
+```{r}
+min_rel_error <- min(error_by_log_bin$mean_rel_error, na.rm=TRUE)
+
+# Add % difference from best-performing bin
+error_by_log_bin <- error_by_log_bin %>%
+  mutate(
+    rel_pct_diff = 100 * (mean_rel_error - min_rel_error) / min_rel_error)
+
+print(error_by_log_bin) 
+
+ggplot(error_by_log_bin, aes(x = factor(log_bin), y = rel_pct_diff)) +
+  geom_col(fill = "red", alpha = 0.7) +
+  labs(
+    title = "Relative % Difference in Error by Bucket",
+    x = "Bucket",
+    y = "Relative % Difference from Lowest Error Bucket"
+  ) +
+  geom_text(aes(label = paste0(round(rel_pct_diff, 1), "%")), vjust = -0.5) +
+  theme_minimal()
+
+```
+
+## Percentage within 5% and 10%
+```{r}
+ggplot(error_by_log_bin, aes(x = factor(log_bin))) +
+  geom_col(aes(y = pct_within_10 * 100), fill = "blue", alpha = 0.7) +
+  geom_col(aes(y = pct_within_5 * 100), fill = "red", alpha = 0.7) +
+  labs(
+    title = "Percentage of Predictions Within ±5% and ±10%",
+    x = "Log Bin",
+    y = "Percentage (%)"
+  ) +
+  theme_minimal()
+
+```
+
+# Plots
+## Combined Predicted + Observed
+```{r}
+unlabeled$cafo_count <- unlabeled_df$pred_cafo
+
+combined_sf <- rbind(
+  unlabeled[, c("geometry", "cafo_count")],
+  labeled[, c("geometry", "cafo_count")]
+)
+
+have_cafos <- unique(combined_cafos$state_name)
+not_cafo_states <- us_counties_contiguous %>%
+  filter(!(STATE_NAME %in% have_cafos))
+not_cafo_states |> 
+  st_union() -> notcafo
+
+summary(combined_sf$cafo_count)
+quantile(combined_sf$cafo_count, probs = seq(0, 1, 0.1))
+
+combined_sf$cafo_count <- as.numeric(combined_sf$cafo_count)
+
+# labs(title = "Observed + Predicted CAFO Density") +
+ggplot(combined_sf) +
+  geom_sf(aes(fill = log1p(cafo_count)), color = NA) +
+  geom_sf(data = notcafo, color="red", fill = NA, linewidth = 0.5) +
+  scale_fill_viridis_c(option = "plasma", name = "log1p(CAFO count)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+ggsave("obs_pred.jpeg", width=8, height=5)
+
+```
+
+## Combined Predicted
+```{r}
+labeled$pred_cafo <- labeled_df$predicted_cafo
+unlabeled$pred_cafo <- unlabeled_df$pred_cafo
+combined_sf2 <- rbind(
+  unlabeled[, c("geometry", "pred_cafo")],
+  labeled[, c("geometry", "pred_cafo")])
+combined_sf2 <- st_as_sf(combined_sf2, coords = c("y", "x"), crs = st_crs(us_grid))
+
+combined_sf2 <- st_join(us_grid, combined_sf2, left = TRUE) 
+combined_sf2$pred_cafo[is.na(combined_sf2$pred_cafo)] <- 0
+
+plot_sample <- combined_sf2 %>%
+  sample_frac(0.35)  #took sample of 30% of cells for memory
+
+ggplot() +
+  geom_sf(data = plot_sample, aes(fill = log1p(pred_cafo)), color = NA) +
+  geom_sf(data = notcafo, linewidth = 0.5, color = "red", fill = NA) +
+  scale_fill_viridis_c(option="plasma") +
+  labs(title = "Predicted CAFO Count (log1p)",
+       fill = "log1p(CAFO Count)") + 
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+ggsave("pred_cafo.jpeg", width=8, height=5)
+
+```
+
+## Labeled Predicted vs. Observed
+```{r, fig.width = 15, fig.height = 5}
+us_labeled_grid <- us_grid %>%
+  filter(STATE_N %in% unique(combined_cafos$state_name))
+
+# title = "Labeled Training Data: Predicted CAFO Count",
+p1 <- ggplot(us_labeled_grid) +
+  geom_sf(data = labeled, aes(fill = pred_cafo), color=NA) +
+  scale_fill_viridis_c(limits = c(0,30), oob = scales::squish, name = "Predicted CAFO Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# title = "Labeled Training Data: Observed CAFO Count",
+p2 <- ggplot(us_labeled_grid) +
+  geom_sf(data = labeled, aes(fill = cafo_count), color=NA) +
+  scale_fill_viridis_c(limits = c(0,30), oob = scales::squish, name = "Observed CAFO Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+combined_plot <- grid.arrange(p1,p2, ncol=2)
+ggsave("labeled_pred_obs.jpeg", combined_plot, width = 15, height= 5)
+
+
+
+```
+
