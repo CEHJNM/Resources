@@ -1,0 +1,512 @@
+---
+title: "More Data"
+author: "Nidhi Ram"
+date: "2025-06-26"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(tidyverse)
+library(sf) 
+library(ggplot2) 
+library(leaflet) 
+library(dplyr) 
+library(tigris) 
+library(tidyr)
+library(gt)
+library(zipcodeR)
+library(maps)
+library(tidycensus)
+library(terra)
+library(exactextractr)
+library(raster)
+library(tidycensus)
+library(ggthemes)
+library(units)
+```
+
+```{r, userdirectory, echo = TRUE, message=FALSE, warning=FALSE}
+
+# Set user directory and folder
+user <- "/Users/nidhiram"
+directory <- "/Downloads"
+folder <- "/Summer 2025 Project" 
+
+# Set working directory
+working_directory <- "/Users/nidhiram/Downloads/Summer 2025 Project"
+print(working_directory)
+setwd(working_directory)
+
+```
+
+# Population Density
+```{r}
+population_count <- rast("data/2020_Dasymetric_Population_CONUS_V1_1/2020_Dasymetric_Population_CONUS_V1_1.tif")
+us_grid2 <- st_transform(us_grid, st_crs(population_count))
+us_grid2$pop_sum <- exact_extract(population_count, us_grid2, "sum")
+us_grid2 <- st_transform(us_grid2, 5070)
+
+
+us_grid$population <- us_grid2$pop_sum
+us_grid$pop_density <- us_grid$population / us_grid$area_km2
+
+
+ggplot(us_grid) +
+  geom_sf(aes(fill = pop_density)) +
+  scale_fill_viridis_c(option = "C") +
+  theme_minimal() +
+  labs(title = "Population Density",
+       fill = "Density")
+
+minnesota_counties$pop_sum <- exact_extract(population_count, minnesota_counties, "sum")
+minnesota_counties <- minnesota_counties %>%
+  mutate(area_m2 = st_area(geometry), area_km2 = area_m2 / 1e6, pop_density = pop_sum / area_km2)
+minnesota_counties$pop_density <- as.numeric(minnesota_counties$pop_density)
+
+ggplot(minnesota_counties) +
+  geom_sf(aes(fill = pop_density)) +
+  scale_fill_viridis_c(option = "C") +
+  theme_minimal() +
+  labs(title = "Population Count (MN)",
+       fill = "People per County")
+
+st_write(mn_counties2, "minnesota.shp")
+
+```
+
+# Environmental Justice Index
+```{r}
+eji <- read.csv("data/EJI_2024_United_States_CSV/EJI_2024_United_States.csv")
+eji$COUNTYFP  <- sprintf("%03s", eji$COUNTYFP)
+eji$STATEFP <- sprintf("%02s", eji$STATEFP)
+
+eji <- eji %>% 
+  mutate(pop_eji = E_TOTPOP * RPL_EJI, FIPS = paste0(STATEFP, COUNTYFP))
+
+
+county_eji <- eji %>%
+  group_by(FIPS) %>%
+  summarise(mean_EJI = mean(RPL_EJI, na.rm=TRUE),
+    pop_weighted_EJI = sum(pop_eji, na.rm=TRUE) / sum(E_TOTPOP, na.rm=TRUE))
+
+minnesota_counties <- left_join(minnesota_counties, county_eji, by="FIPS")
+minnesota_grid <- left_join(minnesota_grid, county_eji, by="FIPS")
+minnesota_grid <- subset(minnesota_grid, select = -c(pop_weighted_EJI))
+
+
+us_counties_midwest <- left_join(us_counties_midwest, county_eji, by="FIPS")
+midwest_grid <- left_join(midwest_grid, county_eji, by="FIPS")
+midwest_grid <- subset(midwest_grid, select = -c(pop_weighted_EJI))
+
+us_counties_contiguous <- left_join(us_counties_contiguous, county_eji, by="FIPS")
+us_grid <- left_join(us_grid, county_eji, by="FIPS")
+us_grid <- subset(us_grid, select = -c(pop_weighted_EJI))
+
+```
+
+
+# Agricultural Employment and Wages
+```{r}
+library(tidycensus)
+library(tidyverse)
+library(viridis)
+tract_employment <- get_acs(geography = "tract", variables = c("C24030_001", "C24030_032", "C24030_005"), year = 2023, output= "wide", state = contiguous_states, geoemtry=TRUE)
+tracts <- tracts(cb = TRUE, refresh=TRUE)
+tracts <- st_transform(tracts, crs = 5070)
+tracts$STATEFP  <- sprintf("%02s", tracts$STATEFP)
+tracts$COUNTYFP <- sprintf("%03s", tracts$COUNTYFP)
+tracts$FIPS <- paste0(tracts$STATEFP, tracts$COUNTYFP)
+
+tract_employment <- left_join(tract_employment, tracts, by = "GEOID")
+tract_employment <- subset(tract_employment, select = -c(STATEFP, COUNTYFP, TRACTCE, GEOIDFQ, NAMELSAD, ALAND, AWATER))
+tract_employment <- subset(tract_employment, select = -c(NAME.y, LSAD, NAME.x))
+
+tract_employment <- subset(tract_employment, select = -c(C24030_001M, C24030_032M, C24030_005M))
+tract_employment <- tract_employment %>% rename(total_employment = C24030_001E, male_ag_employment = C24030_005E, female_ag_employment = C24030_032E) %>%
+  rename(COUNTY = NAMELSADCO)
+tract_employment <- tract_employment %>%
+  mutate(ag_employment = male_ag_employment + female_ag_employment) %>%
+  mutate(pct_ag = 100 * ag_employment / total_employment) 
+tract_employment$pct_ag <- tract_employment$pct_ag / 100
+tract_employment <- subset(tract_employment, select = -c(geometry))
+
+
+
+```
+
+## Assign to Grid
+```{r}
+us_grid_centroids <- st_centroid(us_grid)
+grid_with_geoid <- st_join(us_grid_centroids, dplyr::select(tracts, GEOID), join = st_within) 
+missing <- is.na(grid_with_geoid$GEOID)
+grid_intersect <- st_join(us_grid[missing, ], dplyr::select(tracts, GEOID), join = st_intersects, left=FALSE)
+grid_with_geoid$GEOID <- ifelse(missing, grid_intersect$GEOID, grid_with_geoid$GEOID)
+us_grid$GEOID <- grid_with_geoid$GEOID
+
+us_grid <- left_join(us_grid, tract_employment, by = "GEOID")
+us_grid <- subset(us_grid, select = -c(FIPS.y))
+us_grid <- st_transform(us_grid, crs = 5070)
+us_grid <- us_grid %>%
+  dplyr::select(cropland:uninhabited, Number_of_Farms:pct_ag, FIPS = FIPS.x, geometry)
+
+```
+
+
+## distance to cluster
+```{r}
+tract_employment <- left_join(us_grid, tract_employment, by = "GEOID")
+
+ag_centroids <- us_grid %>%
+  mutate(ag_employment = replace_na(ag_employment, 0)) %>%
+  st_centroid()
+threshold <- quantile(ag_centroids$ag_employment, 0.9, na.rm = TRUE)
+ag_clusters <- ag_centroids %>% filter(ag_employment >= threshold)
+
+dist_matrix <- st_distance(st_centroid(us_grid), st_centroid(ag_clusters))
+
+# Take minimum distance for each grid cell
+us_grid$dist_to_ag_cluster_km <- apply(dist_matrix, 1, min) / 1000  # in km
+
+```
+
+# Midwest TRI
+```{r}
+mw_toxic_releases <- read.csv("midwest_tri.csv")
+mw_toxic_releases <- st_as_sf(mw_toxic_releases, coords = c("Longitude", "Latitude"),crs = 5070)
+
+mw_toxic_releases <- st_transform(mw_toxic_releases, 5070)
+mw_toxic_releases <- mw_toxic_releases %>% rename(`releases` = `Releases..lb.`)
+mw_toxic_releases$releases <- decomma(mw_toxic_releases$releases)
+
+mw_toxic_releases$releases <- as.numeric(mw_toxic_releases$releases)
+summary(mw_toxic_releases$releases)
+hist(mw_toxic_releases$releases)
+
+mw_toxic_releases$releases[is.na(mw_toxic_releases$releases)] <- 0
+us_counties_midwest |> 
+  st_union() -> Midwest
+
+ggplot() +
+  geom_sf(
+    data = Midwest,
+    fill = "white",
+    color = "black"
+    ) +
+  geom_sf(
+    data = mw_toxic_releases,
+    aes(color = releases))
+
+
+library(gstat)
+idw(formula = releases ~ 1, locations = mw_toxic_releases, newdata = midwest_grid, idp = 2.5) -> idw_output
+summary(idw_output$var1.pred)
+hist(idw_output$var1.pred)
+library(classInt)
+nbreaks <- classIntervals(idw_output$var1.pred, n = 5, style = "fisher")$brks
+
+ggplot() +
+  geom_sf(
+    data = Midwest,
+    fill = "white",
+    color = "black"
+  ) +
+  geom_sf(
+    data = idw_output,
+    aes(fill = var1.pred),
+    color = NA,
+    alpha = .9
+  ) +
+  scale_fill_fermenter(
+    direction = 1,
+    palette = "YlOrRd",
+    breaks = nbreaks
+  )
+
+midwest_grid <- st_join(midwest_grid, idw_output, left = TRUE,largest = TRUE)
+midwest_grid <- subset(midwest_grid, select = -c(x, y, var1.var))
+
+bg_employment <- get_acs(geography = "block group", variables = c("C24030_001", "C24030_032", "C24030_005"), year = 2023, output= "wide", state = c("17", "18", "19", "20", "26", "27", "29", "31", "38", "39", "46", "55"), geoemtry=TRUE)
+
+```
+
+# states with cafos
+Maryland, Pennsylvania, Iowa, Missouri, Minnesota, Indiana, Idaho, Washington, Ohio, Michigan, Texas, North Carolina, South Carolina, Virginia
+
+NEED: Oregon, California, Delaware, Illinois, Nebraska, Nevada
+
+Downloaded: LA, NY, AL, AR, CO, FL, GA, MS, WI
+```{r}
+
+cafo_states <- c("Maryland", "Pennsylvania", "Iowa", "Missouri", "Minnesota", "Indiana", "Idaho", "Washington", "Ohio", "Michigan", "Texas", "North Carolina", "South Carolina", "Virginia", "Oregon", "California", "Delaware", "Illinois", "Nebraska", "Nevada", "Louisiana", "New York", "Alabama", "Arkansas", "Colorado", "Florida", "Georgia", "Mississippi", "Wisconsin")
+
+cafo_states <- us_counties_contiguous %>%
+    filter(STATE_NAME %in% cafo_states)
+
+ggplot() +
+  geom_sf(data = us_counties_contiguous, fill = "lightblue", color = "black", size = 0.2) +
+  geom_sf(data = cafo_states, aes(fill = "CAFOs")) + 
+  scale_color_manual(values = c("CAFOs" = "red")) +
+  labs(title = "Publicly Available CAFO Locations in CONUS",
+       fill = "Legend") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5)) 
+ggsave(filename = "CAFO_states.jpg", width = 8, height = 5)
+
+
+```
+
+
+# canpoy cover
+```{r}
+canopy_cover <- rast("data/nlcd_tcc_CONUS_2015_v2023-5_wgs84/nlcd_tcc_conus_wgs84_v2023-5_20150101_20151231.tif")
+us_grid$canopy_cover <- exact_extract(canopy_cover, us_grid, "sum")
+us_grid <- st_as_sf(us_grid)
+```
+
+
+# urban area proximity
+```{r}
+urban_areas <- st_read("data/NTAD_Urban_Areas_644170322766021823/Urban_Areas.shp")
+urban_areas <- st_transform(urban_areas, 5070)
+dist_matrix <- st_distance(st_centroid(us_grid), st_centroid(urban_areas))
+
+us_grid$dist_to_urban <- apply(dist_matrix, 1, min) / 1000  # in km
+
+
+```
+
+
+# meat, poultry, egg facilities
+```{r}
+meat_facilities <- read.csv("data/mpe_facilities.csv")
+meat_facilities <- meat_facilities %>%
+  filter(!is.na(longitude)) %>%
+  filter(!is.na(latitude))
+
+meat_facilities <- st_as_sf(meat_facilities, coords = c("longitude", "latitude"), crs = 5070)
+dist_matrix <- st_distance(st_centroid(us_grid), meat_facilities)
+us_grid$dist_to_facility <- apply(dist_matrix, 1, min) / 1000  # in km
+
+
+```
+
+
+# Soil cores
+```{r}
+library(usmap)
+soil_cores <- read_xls("data/Appendix_2a_Top5_18Sept2013.xls", col_names=TRUE, skip=12)
+soil_cores <- soil_cores[-1, ]
+soil_cores <- st_as_sf(soil_cores, coords = c("Longitude", "Latitude"), crs = 5070)
+
+phosphorus <- subset(soil_cores, select = c(StateID, Top5_P, geometry))
+phosphorus$state_fips <- fips(state = phosphorus$StateID)
+
+phosphorus <- phosphorus %>% filter(state_fips %in% contiguous_states)
+phosphorus$Top5_P <- as.numeric(phosphorus$Top5_P)
+st_write(phosphorus, "phosphorus.shp", row.names = FALSE)
+phosphorus$Top5_P[is.na(phosphorus$Top5_P)] <- 0
+
+# idw
+idw(formula = Top5_P ~ 1, locations = phosphorus, newdata = us_grid, idp = 3, debug.level = 1, nmax = 15) -> idw_output
+summary(idw_output$var1.pred)
+hist(idw_output$var1.pred)
+library(classInt)
+nbreaks <- classIntervals(idw_output$var1.pred, n = 5, style = "fisher")$brks
+
+ggplot() +
+  geom_sf(
+    data = US,
+    fill = "white",
+    color = "black"
+  ) +
+  geom_sf(
+    data = idw_output,
+    aes(fill = var1.pred),
+    color = NA,
+    alpha = .9
+  )
+us_grid$phosphorus <- idw_output$var1.pred
+
+```
+
+
+# census data
+```{r}
+census_socio <- get_acs(geography = "county", variables = c("B01001B_001"),
+  year = 2023,
+  survey = "acs5")
+census_socio2 <- get_acs(geography = "county", variables = c("B01001I_001"),
+  year = 2023,
+  survey = "acs5")
+census_socio$Black_Hispanic <- census_socio$estimate + census_socio2$estimate
+
+census_socio <- subset(census_socio, select = -c(moe, variable, NAME))
+census_socio2 <- subset(census_socio2, select = -c(moe, variable, NAME))
+census_socio <- census_socio %>% rename(Black = estimate)
+census_socio2 <- census_socio2 %>% rename(Hispanic = estimate)
+
+midwest_grid <- left_join(midwest_grid, census_socio, by = c("FIPS" = "GEOID"))
+midwest_grid <- left_join(midwest_grid, census_socio2, by = c("FIPS" = "GEOID"))
+us_grid <- left_join(us_grid, census_socio, by = c("FIPS" = "GEOID"))
+us_grid <- left_join(us_grid, census_socio2, by = c("FIPS" = "GEOID"))
+
+
+census_vars <- load_variables(2023, "acs5")
+
+```
+
+
+# manure nutrients
+```{r}
+manure <- read_excel("data/N-P_from_manure_1950-2017-july23-2020.xlsx", sheet = "2017")
+manure <- subset(manure, select = -c(...25, `cattle-weight-coef`, `hogs-weight-coef`, `chickens-weight-coef`, `broilers-weight-coef`, `turkeys-weight-coef`, `sheep-weight-coef`, `fips-int`, CountyName, State))
+midwest_grid <- left_join(midwest_grid, manure, by = c("FIPS" = "STCOFIPS"))
+midwest_grid$animal_P <- midwest_grid$`Cattle_P_kg-2017` + midwest_grid$`Hogs_P_kg-2017` + midwest_grid$`Poultry_P_kg-2017`
+midwest_grid$animal_N <- midwest_grid$`Cattle_N_kg-2017` + midwest_grid$`Hogs_N_kg-2017` + midwest_grid$`Poultry_N_kg-2017`
+midwest_grid$animal_count <- midwest_grid$cows2017adj + midwest_grid$bcows2017adj + midwest_grid$mcows2017adj + midwest_grid$othercows2017 + midwest_grid$hogs2017adj + midwest_grid$chickens2017adj + midwest_grid$broilers2017adj + midwest_grid$turkeys2017adj + midwest_grid$sheep2017adj + midwest_grid$horses2017adj 
+
+
+```
+
+# air monitors
+```{r}
+air_monitors <- read.csv("data/annual_conc_by_monitor_2024.csv")
+pm25 <- read.csv("data/daily_88101_2024.csv")
+pm25 <- st_as_sf(pm25, coords = c("Longitude", "Latitude"), crs = 5070)
+pm25 <- subset(pm25, select = -c(Parameter.Code, Parameter.Name, POC, Datum, Sample.Duration, Pollutant.Standard, Date.Local, Units.of.Measure, Observation.Count, Observation.Percent, Method.Code, Method.Name, Local.Site.Name, Address, State.Name, County.Name, City.Name, CBSA.Name, Date.of.Last.Change))
+avg_pm25 <- pm25 %>% group_by(Site.Num) %>% summarise(avg_pm25 = mean(Arithmetic.Mean))
+
+
+idw(formula = avg_pm25 ~ 1, locations = avg_pm25, newdata = midwest_grid, idp = 2) -> pm25_idw
+summary(pm25_idw$var1.pred)
+hist(idw_output$var1.pred)
+library(classInt)
+nbreaks <- classIntervals(idw_output$var1.pred, n = 5, style = "fisher")$brks
+
+
+```
+
+# assign fips 
+```{r}
+us_grid_centroids <- st_centroid(us_grid)
+
+us_grid_with_fips <- st_join(us_grid_centroids,
+  dplyr::select(us_counties_contiguous, FIPS),
+  join = st_within)
+
+# Step 2: Identify grid cells with no county assigned
+us_missing <- is.na(us_grid_with_fips$FIPS)
+
+# Step 3: Assign missing grid cells by spatial intersection using the **original grid geometry**
+us_grid_intersect <- st_join(us_grid[us_missing, ],  
+  dplyr::select(us_counties_contiguous, FIPS),
+  join = st_intersects,
+  left = FALSE)
+
+# Step 4: Update FIPS values for missing grid cells
+us_grid_with_fips$FIPS[us_missing] <- us_grid_intersect$FIPS
+
+# Step 5: Transfer FIPS codes to the original grid
+us_grid$FIPS <- us_grid_with_fips$FIPS
+
+
+us_grid <- us_grid %>%
+  left_join(us_counties_contiguous %>%
+      dplyr::select(FIPS, Number_of_Farms) %>%
+      st_drop_geometry(), by = "FIPS")
+
+```
+
+# save grid with features as csv
+```{r}
+write.csv(us_grid, "us_grid.csv")
+st_write(us_grid, "us_grid.shp", row.names = FALSE)
+
+
+```
+
+# open saved grid
+```{r}
+us_grid <- st_read("us_grid/us_grid.shp")
+
+names(us_grid)
+us_grid <- us_grid %>% rename(cropland = croplnd, pastureland = pstrlnd, uninhabited = unnhbtd, RUCC_2023 = RUCC_20, population = popultn, canopy_cover = cnpy_cv, dist_to_ag_cluster_km = dst____, dist_to_facility = dst_t_f, phosphorus = phsphrs, Hispanic = Hispanc, animal_count = anml_cn, animal_N = animl_N, animal_P = animl_P, Other_P_kg_2017 = O_P_.20, Other_N_kg_2017 = O_N_.20, median_income = mdn_ncm, dist_to_urban = dst_t_r, female_ag_employment = fml_g_m, male_ag_employment = ml_g_mp)
+us_grid <- us_grid %>% rename(mean_EJI = men_EJI)
+
+```
+
+# downscaling grid
+```{r}
+ggplot() +
+  geom_sf(
+    data = US,
+    fill = "white",
+    color = "black"
+  ) +
+  geom_sf(
+    data = us_counties_contiguous,
+  ) + theme_minimal()
+
+ggplot() +
+  geom_sf(
+    data = US,
+    fill = "white",
+    color = "black"
+  ) +
+  geom_sf(
+    data = us_grid,
+  ) + theme_minimal()
+
+
+```
+
+# adjusting fips - state
+```{r}
+labeled$STATE_N[labeled$STATE_N == "Vermont"] <- "New York"
+labeled$STUSPS[labeled$STUSPS == "VT"] <- "NY"
+labeled$COUNTY[labeled$COUNTY == "Bennington County"] <- "Rensselaer County"
+
+labeled$STATE_N[labeled$STATE_N == "Delaware"] <- "Texas"
+labeled$STUSPS[labeled$STUSPS == "DE"] <- "TX"
+labeled$COUNTY[labeled$COUNTY == "New Castle County"] <- "Chambers County"
+
+labeled$COUNTY[labeled$COUNTY == "Hudspeth County"] <- "Hyde County"
+
+
+
+```
+
+# state level totals
+```{r}
+state_totals <- read.csv("data/state_totals_2024.csv", skip=6)
+state_totals <- subset(state_totals, select = -c(X, X.1, X.2, X.3, X.4, X.5, X.6, X.7, X.8, X.9))
+state_totals <- state_totals %>% rename(Total_CAFOs = Total.CAFOs1, CAFOs_with_NPDES_permits = CAFOs.with.NPDES.permits2)
+state_totals <- head(state_totals, -5)
+
+state_totals <- state_totals[state_totals$State != "Alaska", ]
+state_totals <- state_totals[state_totals$State != "Hawaii", ]
+state_totals <- state_totals[state_totals$State != "Indian Country (R7)", ]
+state_totals <- state_totals[state_totals$State != "Indian Country (R8)", ]
+state_totals <- state_totals[state_totals$State != "Puerto Rico", ]
+state_totals <- state_totals[state_totals$State != "Virgin Islands", ]
+
+
+state_totals_known <- labeled_df %>%
+  group_by(STATE_N) %>%
+  summarise(total_model = sum(cafo_count, na.rm = TRUE))
+state_totals_known <- state_totals_known[state_totals_known$STATE_N != "Delaware", ]
+state_totals_known <- state_totals_known[state_totals_known$STATE_N != "Maine", ]
+state_totals_known <- state_totals_known[state_totals_known$STATE_N != "Tennessee", ]
+state_totals_known <- state_totals_known[state_totals_known$STATE_N != "Massachusetts", ]
+
+
+# join with totals --> THIS IS INTERESTING !!
+state_totals_known <- state_totals_known %>%
+  left_join(state_totals, by = c("STATE_N" = "State"))
+
+
+```
+
+
