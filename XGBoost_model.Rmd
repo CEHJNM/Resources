@@ -7,13 +7,77 @@ output: pdf_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+
+library(readxl)
+library(tidyverse)
+library(sf) 
+library(ggplot2) 
+library(dplyr) 
+library(tidyr)
+library(maps)
+library(usmap)
+library(xgboost)
+library(caret)
+
+```
+
+# Upload data
+```{r}
+# grid with features
+us_grid <- st_read("data/us_grid_/us_grid.shp")
+
+# update variable names to reflect code 
+names(us_grid)
+us_grid <- us_grid %>% rename(cropland = croplnd, pastureland = pstrlnd, uninhabited = unnhbtd, RUCC_2023 = RUCC_20, population = popultn, canopy_cover = cnpy_cv, dist_to_ag_cluster_km = dst____, dist_to_facility = dst_t_f, phosphorus = phsphrs, Hispanic = Hispanc, animal_count = anml_cn, animal_N = animl_N, animal_P = animl_P, Other_P_kg_2017 = O_P__20, Other_N_kg_2017 = O_N__20, median_income = mdn_ncm, dist_to_urban = dst_t_r, female_ag_employment = fml_g_m, male_ag_employment = ml_g_mp)
+us_grid <- us_grid %>% rename(mean_EJI = men_EJI)
+us_grid <- subset(us_grid, select = -c(caf_cnt, has_dat, ep_ttls, EPA_Rgn, Tt_CAFO, CAFO__N))
+
+```
+
+# CAFO data
+```{r}
+combined_cafos <- st_read("data/combined_cafos/combined_cafos_final.shp")
+
+```
+
+# EPA CAFO density
+```{r}
+epa_cafo_density <- st_read("data/CAFO_Density/CAFOs_per_County.shp")
+epa_cafo_density <- as.data.frame(list(FIPS = epa_cafo_density$FIPS, number = epa_cafo_density$CAFOs), row.names=NULL, optional=FALSE)
+epa_cafo_density$FIPS <- str_pad(epa_cafo_density$FIPS, width = 5, side = "left", pad = "0")
+```
+
+# State CAFO data
+```{r}
+state_totals <- read.csv("data/state_totals_2024.csv", skip=6)
+state_totals <- subset(state_totals, select = -c(X, X.1, X.2, X.3, X.4, X.5, X.6, X.7, X.8, X.9))
+state_totals <- state_totals %>% rename(Total_CAFOs = Total.CAFOs1, CAFOs_with_NPDES_permits = CAFOs.with.NPDES.permits2)
+state_totals <- head(state_totals, -5)
+
+state_totals <- state_totals[state_totals$State != "Alaska", ]
+state_totals <- state_totals[state_totals$State != "Hawaii", ]
+state_totals <- state_totals[state_totals$State != "Indian Country (R7)", ]
+state_totals <- state_totals[state_totals$State != "Indian Country (R8)", ]
+state_totals <- state_totals[state_totals$State != "Puerto Rico", ]
+state_totals <- state_totals[state_totals$State != "Virgin Islands", ]
+
+
+```
+
+# Merge state and county level totals
+```{r}
+epa_cafo_density <- epa_cafo_density %>% rename(epa_totals = number)
+us_grid <- us_grid %>%
+  left_join(epa_cafo_density, by="FIPS")
+us_grid <- us_grid %>%
+  left_join(state_totals, by = c("STATE_N" = "State"))
+
 ```
 
 # Prepare data
 ```{r}
 us_grid <- st_transform(us_grid, 5070)
 us_grid$cafo_count <- lengths(st_intersects(us_grid, combined_cafos))
-us_grid <- subset(us_grid, select = -c(has_dat))
 
 known_states <- fips(state = unique(combined_cafos$state_name))
 us_grid$has_data <- substr(us_grid$FIPS, 1, 2) %in% known_states # model on data we have
@@ -58,7 +122,6 @@ labeled <- labeled[!is.na(labeled$`animal_count`), ]
 labeled <- labeled[!is.na(labeled$`female_ag_employment`), ]
 
 labeled_df <- na.omit(labeled_df)
-us_grid_df <- na.omit(us_grid_df)
 
 labeled_df$class <- cut(
   labeled_df$cafo_count,
@@ -110,20 +173,14 @@ xgb_grid <- expand.grid(
 
 # Model
 ```{r}
+
 features <- c("cropland", "pastureland", "RUCC_2023", "methane", "mean_EJI", "population", "canopy_cover", "dist_to_ag_cluster_km", "dist_to_facility", "phosphorus", "Black", "Hispanic", "animal_count", "animal_N", "animal_P", "Other_P_kg_2017", "Other_N_kg_2017", "median_income", "dist_to_urban", "female_ag_employment", "male_ag_employment","epa_totals", "Total_CAFOs", "crop_density", "ag_intensity", "rural_income", "x", "y")
 
-xgb_model <- caret::train(
-  log_cafo ~  cropland + pastureland + population + mean_EJI + canopy_cover + dist_to_facility + Black +
-    animal_count + animal_P + animal_N + median_income + `Other_P_kg_2017` + Hispanic + dist_to_ag_cluster_km + 
-    RUCC_2023  + `Other_N_kg_2017` + dist_to_urban + methane + phosphorus + x + y + epa_totals + Total_CAFOs + rural_income + crop_density + ag_intensity,
-  data = labeled_df,
-  method = "xgbTree",
-  trControl = tr_control,
-  tuneGrid = xgb_grid,
-  verbosity = 1, weights = labeled_df$weight)
-
-
-# look at correlation between variables, discard those with strong correlations
+xgb_model <- caret::train(log_cafo ~ cropland + pastureland + population + mean_EJI + canopy_cover + dist_to_facility + Black + animal_count + animal_P + animal_N + median_income + `Other_P_kg_2017` + Hispanic + dist_to_ag_cluster_km + RUCC_2023  + `Other_N_kg_2017` + dist_to_urban + methane + phosphorus + x + y + epa_totals + Total_CAFOs + rural_income + crop_density + ag_intensity,
+                          data = labeled_df,
+                          method = "xgbTree",
+                          trControl = tr_control,
+                          tuneGrid = xgb_grid, weights = labeled_df$weight)
 
 ```
 
